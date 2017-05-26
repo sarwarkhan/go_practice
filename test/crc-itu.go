@@ -5,6 +5,7 @@ package main
 import (
 	"encoding/hex"
 	"fmt"
+	"strconv"
 )
 
 func main() {
@@ -17,7 +18,16 @@ func main() {
 	fmt.Println(b)
 	crc := Checksum(b, table)
 
-	fmt.Printf("CRC16_X_25: %X, Type: %T", crc, crc)
+	fmt.Printf("CRC16_X_25: %X, Type: %T\n", crc, crc)
+
+	sampleErrCode := "8CDD"
+	// convert to unit16
+	erroCodeInUnit16, _ := strconv.ParseUint(sampleErrCode, 16, 16)
+	errorCode := uint16(erroCodeInUnit16)
+
+	if crc == errorCode {
+		fmt.Printf("Error code: %X, Type: %T", errorCode, errorCode)
+	}
 }
 
 func ReverseByte(val byte) byte {
