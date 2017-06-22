@@ -458,6 +458,6 @@ func toFixed(num float64) float64 {
 
 func timeDifferenceInMinutes(startTime time.Time, endTime time.Time) float64 {
 	duration := endTime.Sub(startTime)
-	diffInSecond := duration.Minutes()
-	return diffInSecond
+	diffInMinutes := duration.Minutes()
+	return diffInMinutes
 }
