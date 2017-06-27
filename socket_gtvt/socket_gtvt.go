@@ -41,10 +41,12 @@ func handleClient(conn net.Conn) {
 		SMS_HOST_PASS := ""
 		SMS_SENDER := ""
 		SMS_API := fmt.Sprint("http://app.planetgroupbd.com/api/sendsms/plain?user=", SMS_HOST_USER, "&password=", SMS_HOST_PASS, "&sender=", SMS_SENDER)
-		line, err := bufio.NewReader(conn).ReadString('\n')
+		inData, err := bufio.NewReader(conn).ReadString('\n')
 		if err != nil {
+			fmt.Println("Erro in reading")
 			return
 		}
+		line := string(inData)
 		// load Bangladesh time zone
 		timeLocation, _ := time.LoadLocation("Asia/Dhaka")
 		currentTimeInDhaka := time.Now().In(timeLocation)
@@ -55,6 +57,12 @@ func handleClient(conn net.Conn) {
 		formatedDate := dateTimeArray[0]
 		formatedTime := dateTimeArray[1]
 		weekDay := int(currentTimeInDhaka.Weekday())
+		if weekDay == 0 {
+			weekDay = 6
+		} else {
+			weekDay -= 1
+		}
+
 		/* start test */
 		fmt.Printf("formatedDate: %s, Type: %T\n", formatedDate, formatedDate)
 		fmt.Printf("formatedTime: %s, Type: %T\n", formatedTime, formatedTime)
@@ -131,7 +139,7 @@ func handleClient(conn net.Conn) {
 		acStatus := sensorData[1:2]
 		fmt.Printf("acStatus: %s, Type: %T\n", acStatus, acStatus)
 		//db connection
-		db, dbError := sql.Open("mysql", "root:@/test")
+		db, dbError := sql.Open("mysql", "root:root@/geon_vts")
 		if dbError != nil {
 			return
 		}
@@ -273,9 +281,9 @@ func handleClient(conn net.Conn) {
 					weekDayFlag := false
 					geofenceCoordinates := ""
 
-					geofenceScheduleSelectSQL := "SELECT GFS.geofence_id, GFS.vehicle_id, GFS.week_day, GFS.start_time, GFS.end_time, GFS.is_active, GFS.geofence_coordinates"
+					geofenceScheduleSelectSQL := "SELECT GFS.geofence_id, GFS.vehicle_id, GFS.week_day, GFS.start_time, GFS.end_time, GFS.is_active, GF.geofence_coordiantes"
 					geofenceScheduleSelectSQL = fmt.Sprint(geofenceScheduleSelectSQL, " FROM geo_fence_schedules AS GFS")
-					geofenceScheduleSelectSQL = fmt.Sprint(geofenceScheduleSelectSQL, " LEFT JOIN geo_fence AS GF ON GF.geofence_id = GFS.geofence_id")
+					geofenceScheduleSelectSQL = fmt.Sprint(geofenceScheduleSelectSQL, " LEFT JOIN geo_fences AS GF ON GF.geofence_id = GFS.geofence_id")
 					geofenceScheduleSelectSQL = fmt.Sprint(geofenceScheduleSelectSQL, " WHERE GFS.is_active = 1 AND GFS.vehicle_id = ? AND (? BETWEEN GFS.start_time AND GFS.end_time)")
 					geofenceSchedules, scheduleError := db.Query(geofenceScheduleSelectSQL, _vehicleId, dataProcessingTime)
 					if scheduleError == nil {
@@ -292,12 +300,13 @@ func handleClient(conn net.Conn) {
 							}
 						}
 					}
+
 					if weekDayFlag {
 						vertics := []pip.Point{}
 						fence := strings.Split(geofenceCoordinates, "|")
 						// complete the fence by pushing first vertics
 						fence = append(fence, fence[0])
-
+						fmt.Println(fence)
 						for i := 0; i < len(fence); i++ {
 							pointString := strings.Split(fence[i], ",")
 							xAxis, _ := strconv.ParseFloat(pointString[0], 64)
@@ -308,8 +317,8 @@ func handleClient(conn net.Conn) {
 							vertics,
 						}
 						checkPoint := pip.Point{X: latitudeInDecimalMinutes, Y: longitudeInDecimalMinutes}
+						fmt.Println(checkPoint)
 						insideGeofence := pip.PointInPolygon(checkPoint, geofencePloygon) //false=outside | true=inside geofence
-
 						geofenceAlartMessage := ""
 						geofenceAlartSMSFlag := false
 						if len(locationAddress) == 0 {
@@ -342,7 +351,7 @@ func handleClient(conn net.Conn) {
 							geofenceSMSStatus = "OUT"
 						}
 						if geofenceAlartSMSFlag {
-							isSMSLogUpdated = updateSMSLog(db, _userId, _vehicleId, _smsYear, _smsMonth, _smsTotal, _smsUsed, _smsRemain, "OVER_SPEED", geofenceAlartMessage, _callBackSim, formatedDateTime, geofenceSMSStatus)
+							isSMSLogUpdated = updateSMSLog(db, _userId, _vehicleId, _smsYear, _smsMonth, _smsTotal, _smsUsed, _smsRemain, "GEO_FENCE", geofenceAlartMessage, _callBackSim, formatedDateTime, geofenceSMSStatus)
 							if isSMSLogUpdated {
 								geofenceSmsText := url.QueryEscape(geofenceAlartMessage)
 								smsApiUrl = fmt.Sprint(SMS_API, "&SMSText=", geofenceSmsText, "&GSM=", _callBackSim)
