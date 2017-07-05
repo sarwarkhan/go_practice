@@ -1,12 +1,15 @@
 package main
 
 import (
-	"bufio"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
+	"pip"
 	"strconv"
 	"strings"
 	"time"
@@ -33,11 +36,11 @@ func main() {
 }
 
 func handleClient(conn net.Conn) {
-	//SMS_INTERVAL := 10.00 //in minutes
-	//SMS_HOST_USER := ""
-	//SMS_HOST_PASS := ""
-	//SMS_SENDER := ""
-	//SMS_API := fmt.Sprint("http://app.planetgroupbd.com/api/sendsms/plain?user=", SMS_HOST_USER, "&password=", SMS_HOST_PASS, "&sender=", SMS_SENDER)
+	SMS_INTERVAL := 10.00 //in minutes
+	SMS_HOST_USER := ""
+	SMS_HOST_PASS := ""
+	SMS_SENDER := ""
+	SMS_API := fmt.Sprint("http://app.planetgroupbd.com/api/sendsms/plain?user=", SMS_HOST_USER, "&password=", SMS_HOST_PASS, "&sender=", SMS_SENDER)
 	/* client connection state */
 	loginState := false
 	locationDataFlag := false
@@ -68,441 +71,711 @@ func handleClient(conn net.Conn) {
 	bearing := "0"
 	//crlf := []byte("\r\n")
 	for {
-		line, _, err := bufio.NewReader(conn).ReadLine()
+		conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		buf := make([]byte, 256)
+		read_len, err := conn.Read(buf)
 		if err != nil {
-			fmt.Println("Error in reading ...")
-			return
-		}
-		data := hex.EncodeToString(line)
-		incomingDataPacket := fmt.Sprint(data, "0d0a")
-		fmt.Println(incomingDataPacket) //print
-		if len(incomingDataPacket) < 30 {
+			//fmt.Println("Error in reading ...")
+			//fmt.Println(err.Error())
 			continue
 		}
+		//fmt.Println(fmt.Sprint("DATA LENGTH: ", read_len))
+		data := hex.EncodeToString(buf[:read_len])
+		//data sent from terminal split by stop bits
+		incomingDataArray := strings.Split(data, "0d0a")
 
-		startBits := incomingDataPacket[:4]
-		if startBits == "7878" { // normal data
-			// load Bangladesh time zone
-			timeLocation, _ := time.LoadLocation("Asia/Dhaka")
-			currentTimeInDhaka := time.Now().In(timeLocation)
-			//special consideration
-			timeFormat := "2006-01-02 15:04:05"
-			dateTimeFormated = currentTimeInDhaka.Format(timeFormat)
-			dateTimeArray := strings.Split(dateTimeFormated, " ")
-			dateFormated = dateTimeArray[0]
-			//timeFormated := dateTimeArray[1]
-			//day number of week adjustment with db
-			weekDay := int(currentTimeInDhaka.Weekday())
-			if weekDay == 0 {
-				weekDay = 6
-			} else {
-				weekDay -= 1
-			}
-
-			/* incoming data packet length */
-			incomingDataPacketLength := len(incomingDataPacket)
-			//incomingDataLength := incomingDataPacket[4:6]   //data length string
-			incomingDataProtocol := incomingDataPacket[6:8] //incoming data protocol
-			/* Serial No from incoming data */
-			serialNoPosition := incomingDataPacketLength - 12
-			serialNo := incomingDataPacket[serialNoPosition : serialNoPosition+4]
-			/* Error code from incoming data */
-			errorCodeStartPosition := incomingDataPacketLength - 8
-			incomingDataErrorCode := incomingDataPacket[errorCodeStartPosition : errorCodeStartPosition+4]
-			/* stop bits */
-			stopBitsPosition := incomingDataPacketLength - 4
-			stopBits := incomingDataPacket[stopBitsPosition:]
-			/* error code checking string */
-			errorCodeCheckStrLength := incomingDataPacketLength - 4 - 8
-			strForErrorCode := incomingDataPacket[4 : 4+errorCodeCheckStrLength]
-
-			/* check error code */
-			table := MakeTable(CRC16_X_25)
-			incomingErrorHex, _ := hex.DecodeString(strForErrorCode)
-			incomingDataCRC := Checksum(incomingErrorHex, table)        //Error code in uint16
-			crcCheck := strconv.FormatUint(uint64(incomingDataCRC), 16) //Error code in string
-			if incomingDataErrorCode != crcCheck {                      //consider as void data
-				fmt.Println("** VOID Data")
-				dataType = "V"
-			}
-
-			/* Handle Login data Terminal id */
-			if incomingDataProtocol == "01" && dataType == "A" {
-				terminalId = incomingDataPacket[8:24] //8+16 = 24
-				fmt.Println(fmt.Sprint("Terminal ID: ", terminalId))
-			}
-
-			/* handle DB connection */
-			db, dbError := sql.Open("mysql", "root:@/test")
-			if dbError != nil {
-				fmt.Println("** DB Connection Error")
-				continue
-			}
-
-			/* handle heart-bit data */
-			if incomingDataProtocol == "13" && loginState == true && dataType == "A" {
-				terminalStatus := incomingDataPacket[8:10]
-				voltageLevelStatus := incomingDataPacket[10:12]
-				gsmSignalStrength := incomingDataPacket[12:14]
-				alarmStatus := incomingDataPacket[14:16]
-				alarmLanguage := incomingDataPacket[16:18]
-				/* convert terminal information into binary */
-				sensorDataBinary, sensorDataConversionError := hex2Bin(terminalStatus)
-				if sensorDataConversionError != nil {
-					fmt.Println("-> Sensor data conversion error for data-protocol 13: " + terminalId)
-					db.Close()
-					continue
+		/* Open DB connection */
+		db, dbError := sql.Open("mysql", "root:@/test")
+		if dbError != nil {
+			fmt.Println("** DB Connection Error")
+			continue
+		}
+		for i := 0; i < len(incomingDataArray)-1; i++ {
+			incomingDataPacket := fmt.Sprint(incomingDataArray[i], "0d0a")
+			/*print*/
+			fmt.Println(fmt.Sprint("DATA CHUNK: ", incomingDataPacket))
+			startBits := incomingDataPacket[:4]
+			if startBits == "7878" { // normal data
+				// load Bangladesh time zone
+				timeLocation, _ := time.LoadLocation("Asia/Dhaka")
+				currentTimeInDhaka := time.Now().In(timeLocation)
+				//special consideration
+				timeFormat := "2006-01-02 15:04:05"
+				dateTimeFormated = currentTimeInDhaka.Format(timeFormat)
+				dateTimeArray := strings.Split(dateTimeFormated, " ")
+				dateFormated = dateTimeArray[0]
+				//timeFormated := dateTimeArray[1]
+				//day number of week adjustment with db
+				weekDay := int(currentTimeInDhaka.Weekday())
+				if weekDay == 0 {
+					weekDay = 6
+				} else {
+					weekDay -= 1
 				}
-				// Update global variable for this connection
-				fuelConnectionStatus = sensorDataBinary[:1]
-				gpsTrackingStatus = sensorDataBinary[1:2]
-				alarmType = sensorDataBinary[2:5]
-				chargeStatus = sensorDataBinary[5:6]
-				engine, engineErr := strconv.Atoi(sensorDataBinary[6:7])
-				if engineErr != nil {
-					fmt.Println("-> Engine status error for data-protocol 13: " + terminalId)
-					db.Close()
-					continue
-				}
-				engineStatus = engine
-				if engineStatus == 0 {
-					speedInDecimal = 0.00
-				}
-				defenceStatus = sensorDataBinary[7:8]
 
-				/* prepare insert query for gps_data_tr06 table */
-				if locationDataFlag == true {
-					lastLocationDataTimeDiff := timeDifferenceInMinutes(locationDataLastTime, time.Now())
-					if lastLocationDataTimeDiff >= 3.00 {
-						//update previous location data update time
-						locationDataLastTime = time.Now()
+				/* incoming data packet length */
+				incomingDataPacketLength := len(incomingDataPacket)
+				//incomingDataLength := incomingDataPacket[4:6]   //data length string
+				incomingDataProtocol := incomingDataPacket[6:8] //incoming data protocol
+				/* Serial No from incoming data */
+				serialNoPosition := incomingDataPacketLength - 12
+				serialNo := incomingDataPacket[serialNoPosition : serialNoPosition+4]
+				/* Error code from incoming data */
+				errorCodeStartPosition := incomingDataPacketLength - 8
+				incomingDataErrorCode := incomingDataPacket[errorCodeStartPosition : errorCodeStartPosition+4]
+				/* stop bits */
+				stopBitsPosition := incomingDataPacketLength - 4
+				stopBits := incomingDataPacket[stopBitsPosition:]
+				/* error code checking string */
+				errorCodeCheckStrLength := incomingDataPacketLength - 4 - 8
+				strForErrorCode := incomingDataPacket[4 : 4+errorCodeCheckStrLength]
 
-						//insert into gps_data_tr06 table
-						insertSQL := "INSERT gps_data_tr06 SET device_emei=?, record_date=?, record_time=?,"
-						insertSQL = fmt.Sprint(insertSQL, " data_status=?, engine_status=?, speed=?,")
-						insertSQL = fmt.Sprint(insertSQL, " latitude=?, longitude=?, n_s_indicator=?,")
-						insertSQL = fmt.Sprint(insertSQL, " e_w_indicator=?, bearing=?, direction=?,")
-						insertSQL = fmt.Sprint(insertSQL, " ac_status=?, fuel_connection_status=?, gps_tracking_status=?,")
-						insertSQL = fmt.Sprint(insertSQL, " alarm_status=?, alarm_type=?, charge_status=?,")
-						insertSQL = fmt.Sprint(insertSQL, " defence_status=?, voltage_level=?, gsm_signal_strength=?, alarm_language=?")
-						//prepared statement
-						preparedStmt, stmtError := db.Prepare(insertSQL)
-						if stmtError != nil {
-							db.Close()
-							continue
+				/* check error code */
+				table := MakeTable(CRC16_X_25)
+				incomingErrorHex, _ := hex.DecodeString(strForErrorCode)
+				incomingDataCRC := Checksum(incomingErrorHex, table)        //Error code in uint16
+				crcCheck := strconv.FormatUint(uint64(incomingDataCRC), 16) //Error code in string
+				if incomingDataErrorCode != crcCheck {                      //consider as void data
+					fmt.Println("** VOID Data")
+					dataType = "V"
+				}
+
+				/* Handle Login data Terminal id */
+				if incomingDataProtocol == "01" && dataType == "A" {
+					terminalId = incomingDataPacket[8:24] //8+16 = 24
+					fmt.Println(fmt.Sprint("Terminal ID: ", terminalId))
+				}
+
+				/* handle heart-bit data */
+				if incomingDataProtocol == "13" && loginState == true && dataType == "A" {
+					terminalStatus := incomingDataPacket[8:10]
+					voltageLevelStatus := incomingDataPacket[10:12]
+					gsmSignalStrength := incomingDataPacket[12:14]
+					alarmStatus := incomingDataPacket[14:16]
+					alarmLanguage := incomingDataPacket[16:18]
+					/* convert terminal information into binary */
+					sensorDataBinary, sensorDataConversionError := hex2Bin(terminalStatus)
+					if sensorDataConversionError != nil {
+						fmt.Println("-> Sensor data conversion error for data-protocol 13: " + terminalId)
+						continue
+					}
+					// Update global variable for this connection
+					fuelConnectionStatus = sensorDataBinary[:1]
+					gpsTrackingStatus = sensorDataBinary[1:2]
+					alarmType = sensorDataBinary[2:5]
+					chargeStatus = sensorDataBinary[5:6]
+					engine, engineErr := strconv.Atoi(sensorDataBinary[6:7])
+					if engineErr != nil {
+						fmt.Println("-> Engine status error for data-protocol 13: " + terminalId)
+						continue
+					}
+					engineStatus = engine
+					if engineStatus == 0 {
+						speedInDecimal = 0.00
+					}
+					defenceStatus = sensorDataBinary[7:8]
+
+					/* prepare insert query for gps_data_tr06 table */
+					if locationDataFlag == true {
+						/*Print*/
+						//fmt.Println(fmt.Sprint("13->Location data flag set : ", locationDataFlag))
+						lastLocationDataTimeDiff := timeDifferenceInMinutes(locationDataLastTime, time.Now())
+						if lastLocationDataTimeDiff >= 3.00 {
+							//update previous location data update time
+							locationDataLastTime = time.Now()
+
+							//insert into gps_data_tr06 table
+							insertSQL := "INSERT gps_data_tr06 SET device_emei=?, record_date=?, record_time=?,"
+							insertSQL = fmt.Sprint(insertSQL, " data_status=?, engine_status=?, speed=?,")
+							insertSQL = fmt.Sprint(insertSQL, " latitude=?, longitude=?, n_s_indicator=?,")
+							insertSQL = fmt.Sprint(insertSQL, " e_w_indicator=?, bearing=?, direction=?,")
+							insertSQL = fmt.Sprint(insertSQL, " ac_status=?, fuel_connection_status=?, gps_tracking_status=?,")
+							insertSQL = fmt.Sprint(insertSQL, " alarm_status=?, alarm_type=?, charge_status=?,")
+							insertSQL = fmt.Sprint(insertSQL, " defence_status=?, voltage_level=?, gsm_signal_strength=?, alarm_language=?")
+							//prepared statement
+							preparedStmt, stmtError := db.Prepare(insertSQL)
+							if stmtError != nil {
+								continue
+							}
+							//execute prepared statement
+							dbResult, execError := preparedStmt.Exec(terminalId, dateFormated, dateTimeFormated,
+								dataType, engineStatus, speedInDecimal,
+								latitudeInDecimalMinutes, longitudeInDecimalMinutes, n_s_indicator,
+								e_w_indicator, bearing, movingDirection,
+								acStatus, fuelConnectionStatus, gpsTrackingStatus,
+								alarmStatus, alarmType, chargeStatus,
+								defenceStatus, voltageLevelStatus, gsmSignalStrength, alarmLanguage)
+							if execError != nil {
+								continue
+							} else {
+								_ = dbResult
+							}
 						}
-						//execute prepared statement
-						dbResult, execError := preparedStmt.Exec(terminalId, dateFormated, dateTimeFormated,
-							dataType, engineStatus, speedInDecimal,
-							latitudeInDecimalMinutes, longitudeInDecimalMinutes, n_s_indicator,
-							e_w_indicator, bearing, movingDirection,
-							acStatus, fuelConnectionStatus, gpsTrackingStatus,
-							alarmStatus, alarmType, chargeStatus,
-							defenceStatus, voltageLevelStatus, gsmSignalStrength, alarmLanguage)
-						if execError != nil {
-							db.Close()
-							continue
-						} else {
-							_ = dbResult
-						}
-						//make sure db connection is closed
-						db.Close()
 					}
 				}
+				/* handle location data */
+				if incomingDataProtocol == "12" && loginState == true {
+					//update previous location data update time
+					locationDataLastTime = time.Now()
+
+					hexDatetime := incomingDataPacket[8:20]
+					//quantityOfGPS := incomingDataPacket[20:22]
+					hexLatitude := incomingDataPacket[22:30]
+					hexLongitude := incomingDataPacket[30:38]
+					hexSpeed := incomingDataPacket[38:40]
+					hexCourseStatus := incomingDataPacket[40:44]
+					//hexMCC := incomingDataPacket[44:48]
+					//hexMNC := incomingDataPacket[48:50]
+					//hexLAC := incomingDataPacket[50:54]
+					//hexCellID := incomingDataPacket[54:60]
+
+					/* location data datetime */
+					dateTimeFormated = hex2Datetime(hexDatetime)
+					/*Print*/
+					//fmt.Println(fmt.Sprint("12->dateTimeFormated: ", dateTimeFormated))
+					if dateTimeFormated == "" {
+						fmt.Println("Datetime conversion error from hex string")
+						continue
+					}
+					dateFormatedArrayLocation := strings.Split(dateTimeFormated, " ")
+					dateFormated = dateFormatedArrayLocation[0]
+					/* Calculate latitude and longitude */
+					latitudeDecimal, latConverErr := hex2Int(hexLatitude)
+					if latConverErr != nil {
+						fmt.Println("Latitude conversion error from hex string")
+						continue
+					}
+					latitudeInDecimalMinutes = (float64(latitudeDecimal) / 30000) / 60
+					/*Print*/
+					//fmt.Println(fmt.Sprint("12->latitudeInDecimalMinutes: ", latitudeInDecimalMinutes))
+
+					longitudeDecimal, lonConverErr := hex2Int(hexLongitude)
+					if lonConverErr != nil {
+						fmt.Println("Longitude conversion error from hex string")
+						continue
+					}
+					longitudeInDecimalMinutes = (float64(longitudeDecimal) / 30000) / 60
+					/*Print*/
+					//fmt.Println(fmt.Sprint("12->longitudeInDecimalMinutes: ", longitudeInDecimalMinutes))
+
+					/* Calculate speed in km/h */
+					speedFromHex, speedConverErr := hex2Int(hexSpeed)
+					if speedConverErr != nil {
+						fmt.Println("Speed conversion error from hex string")
+						continue
+					}
+					speedInDecimal = float64(speedFromHex)
+					/*Print*/
+					//fmt.Println(fmt.Sprint("12->speedInDecimal: ", speedInDecimal))
+
+					/* Calculate course and status */
+					byteBinary, courceErr := hex2Bin(hexCourseStatus)
+					if courceErr != nil {
+						fmt.Println("Course and status conversion error from hex string")
+						continue
+					}
+					if byteBinary[4:5] == "0" {
+						e_w_indicator = "E"
+					} else {
+						e_w_indicator = "W"
+					}
+					if byteBinary[5:6] == "0" {
+						n_s_indicator = "S"
+					} else {
+						n_s_indicator = "N"
+					}
+
+					/* determine moving direction */
+					if n_s_indicator == "N" {
+						movingDirection = "north"
+					} else {
+						movingDirection = "south"
+					}
+					if e_w_indicator == "E" {
+						movingDirection = fmt.Sprint(movingDirection, "-east")
+					} else {
+						movingDirection = fmt.Sprint(movingDirection, "-west")
+					}
+					/*Print*/
+					//fmt.Println(fmt.Sprint("12->movingDirection: ", movingDirection))
+					bearingValue, bearingConverError := bin2Int(byteBinary[6:16]) //course in decimal degree
+					if bearingConverError == nil {
+						bearing = fmt.Sprint(bearingValue)
+					}
+					/*Print*/
+					//fmt.Println(fmt.Sprint("12->bearing: ", bearing))
+
+					//insert into gps_data_tr06 table
+					insertSQL := "INSERT gps_data_tr06 SET device_emei=?, record_date=?, record_time=?,"
+					insertSQL = fmt.Sprint(insertSQL, " data_status=?, engine_status=?, speed=?,")
+					insertSQL = fmt.Sprint(insertSQL, " latitude=?, longitude=?, n_s_indicator=?,")
+					insertSQL = fmt.Sprint(insertSQL, " e_w_indicator=?, bearing=?, direction=?,")
+					insertSQL = fmt.Sprint(insertSQL, " ac_status=?, fuel_connection_status=?, gps_tracking_status=?,")
+					insertSQL = fmt.Sprint(insertSQL, " alarm_status=?, alarm_type=?, charge_status=?,")
+					insertSQL = fmt.Sprint(insertSQL, " defence_status=?, voltage_level=?, gsm_signal_strength=?, alarm_language=?")
+					//prepared statement
+					preparedStmt, stmtError := db.Prepare(insertSQL)
+					if stmtError != nil {
+						continue
+					}
+					//execute prepared statement
+					dbResult, execError := preparedStmt.Exec(terminalId, dateFormated, dateTimeFormated,
+						dataType, engineStatus, speedInDecimal,
+						latitudeInDecimalMinutes, longitudeInDecimalMinutes, n_s_indicator,
+						e_w_indicator, bearing, movingDirection,
+						acStatus, fuelConnectionStatus, gpsTrackingStatus,
+						alarmStatus, alarmType, chargeStatus,
+						defenceStatus, voltageLevelStatus, gsmSignalStrength, alarmLanguage)
+					if execError != nil {
+						continue
+					} else {
+						_ = dbResult
+					}
+
+					//stop further processing for void data
+					if dataType == "V" {
+						continue
+					}
+
+					/* process next steps */
+					vehicleSelectSQL := "SELECT D.device_id, D.emei_number, VDM.vehicle_id,"
+					vehicleSelectSQL = fmt.Sprint(vehicleSelectSQL, " V.call_back_sim, V.number_plate, V.vehicle_owner_id, V.speed_limit,")
+					vehicleSelectSQL = fmt.Sprint(vehicleSelectSQL, " V.vehicle_is_active, V.is_overspeed_sms, V.is_geofence_sms, V.is_destination_sms,")
+					vehicleSelectSQL = fmt.Sprint(vehicleSelectSQL, " U.user_id, U.user_is_active, U.remaining_sms,")
+					vehicleSelectSQL = fmt.Sprint(vehicleSelectSQL, " SM.sms_year, SM.sms_month, SM.sms_total, SM.sms_used FROM devices AS D")
+					vehicleSelectSQL = fmt.Sprint(vehicleSelectSQL, " LEFT JOIN vehicle_device_mapping AS VDM ON VDM.device_id = D.device_id")
+					vehicleSelectSQL = fmt.Sprint(vehicleSelectSQL, " LEFT JOIN vehicles AS V ON V.vehicle_id = VDM.vehicle_id")
+					vehicleSelectSQL = fmt.Sprint(vehicleSelectSQL, " LEFT JOIN users AS U ON U.user_id = V.vehicle_owner_id")
+					vehicleSelectSQL = fmt.Sprint(vehicleSelectSQL, " LEFT JOIN sms_monthly AS SM ON SM.user_id = U.user_id")
+					vehicleSelectSQL = fmt.Sprint(vehicleSelectSQL, " WHERE D.emei_number=? AND SM.sms_year=? AND SM.sms_month=? LIMIT 1")
+					var _deviceId, _vehicleId, _vehicleOwnerId, _isVehicleActive, _isOverspeedSMS, _isGeofenceSMS, _isDestinationSMS, _userId, _isUserActive, _smsRemain, _smsYear, _smsMonth, _smsTotal, _smsUsed int
+					var _emeiNumber, _callBackSim, _numberPlate string
+					var _speedLimit float64
+					//select vehicle record
+					vSelectError := db.QueryRow(vehicleSelectSQL, terminalId, currentTimeInDhaka.Year(), int(currentTimeInDhaka.Month())).Scan(
+						&_deviceId, &_emeiNumber, &_vehicleId, &_callBackSim,
+						&_numberPlate, &_vehicleOwnerId, &_speedLimit, &_isVehicleActive,
+						&_isOverspeedSMS, &_isGeofenceSMS, &_isDestinationSMS,
+						&_userId, &_isUserActive, &_smsRemain, &_smsYear, &_smsMonth,
+						&_smsTotal, &_smsUsed)
+					if vSelectError != nil {
+						continue
+					}
+					//stop processing incase of inactive vehicle and user
+					if _isVehicleActive == 0 || _isUserActive == 0 {
+						continue
+					}
+					//stop processing if no sms remains
+					if _smsUsed >= _smsTotal && _smsRemain <= 0 {
+						continue
+					}
+					//stop processing incase of invalid call-back sim number
+					if len(_callBackSim) == 0 {
+						continue
+					}
+
+					//imp variable assignment
+					geofenceSMSStatus := "NA"
+					smsApiUrl := ""
+					isSMSLogUpdated := false
+					locationAddress := ""
+					dataProcessingTime, _ := time.Parse(timeFormat, dateTimeFormated)
+
+					// process over speed alarm
+					if _speedLimit < speedInDecimal {
+						if _isOverspeedSMS == 1 {
+							textMessageSpeed := fmt.Sprint("SPEED Limit violation. V: ", _numberPlate, ", SPEED: ", speedInDecimal, " km/h at ")
+							var speedSMSSendingTime string
+							smsLogSelectError := db.QueryRow("SELECT sending_time FROM sms_log WHERE sms_type = 'OVER_SPEED' AND vehicle_id=? ORDER BY sending_time DESC LIMIT 1", _vehicleId).Scan(&speedSMSSendingTime)
+							if smsLogSelectError == nil {
+								elegibleForOverSpeedSMS := false
+								if len(speedSMSSendingTime) == 0 {
+									elegibleForOverSpeedSMS = true
+								} else {
+									speedSMSStartTime, _ := time.Parse(timeFormat, speedSMSSendingTime)
+									previousSpeedSMSSendingTime := timeDifferenceInMinutes(speedSMSStartTime, dataProcessingTime)
+									if previousSpeedSMSSendingTime >= SMS_INTERVAL {
+										elegibleForOverSpeedSMS = true
+									}
+								}
+								if elegibleForOverSpeedSMS {
+									locationForSpeedAlart, addressError := getLocationAddress(latitudeInDecimalMinutes, longitudeInDecimalMinutes)
+									locationAddress = locationForSpeedAlart
+									if addressError == nil {
+										textMessageSpeed = fmt.Sprint(textMessageSpeed, locationAddress)
+										isSMSLogUpdated = updateSMSLog(db, _userId, _vehicleId, _smsYear, _smsMonth, _smsTotal, _smsUsed, _smsRemain, "OVER_SPEED", textMessageSpeed, _callBackSim, dateTimeFormated, geofenceSMSStatus)
+										_smsUsed++
+										_smsRemain--
+										if isSMSLogUpdated {
+											if len(textMessageSpeed) > 160 {
+												textMessageSpeed = textMessageSpeed[:159]
+											}
+											speedSmsText := url.QueryEscape(textMessageSpeed)
+											smsApiUrl = fmt.Sprint(SMS_API, "&SMSText=", speedSmsText, "&GSM=", _callBackSim)
+											//send sms
+											http.Get(smsApiUrl)
+											fmt.Println("-> SMS sent for over speed")
+										}
+									}
+								}
+							}
+						}
+					}
+
+					// process geo-fence alarm
+					if _isGeofenceSMS == 1 {
+						textMessageGeofenceOUT := fmt.Sprint("GEO-FENCE violation. V: ", _numberPlate, ", SPEED: ", speedInDecimal, " km/h at ")
+						textMessageGeofenceIN := fmt.Sprint("Inside GEO-FENCE. V: ", _numberPlate, ", SPEED: ", speedInDecimal, " km/h at ")
+						var geofenceSMSSendingTime string
+						geofenceSMSLogSelectError := db.QueryRow("SELECT sending_time, geofence_sms_status FROM sms_log WHERE sms_type = 'GEO_FENCE' AND vehicle_id=? ORDER BY sending_time DESC LIMIT 1", _vehicleId).Scan(&geofenceSMSSendingTime, &geofenceSMSStatus)
+						if geofenceSMSLogSelectError == nil {
+							geofenceINFlag := false
+							geofenceOUTFlag := false
+							if len(geofenceSMSSendingTime) == 0 {
+								geofenceOUTFlag = true
+							} else {
+								geofenceSMSStartTime, _ := time.Parse(timeFormat, geofenceSMSSendingTime)
+								previousGeofenceSMSSendingTime := timeDifferenceInMinutes(geofenceSMSStartTime, dataProcessingTime)
+								if previousGeofenceSMSSendingTime >= SMS_INTERVAL {
+									if geofenceSMSStatus == "IN" {
+										geofenceOUTFlag = true
+									} else if geofenceSMSStatus == "OUT" {
+										geofenceINFlag = true
+									}
+								}
+							}
+
+							if geofenceINFlag || geofenceOUTFlag {
+								//process geo-fence violation
+								weekDayFlag := false
+								geofenceCoordinates := ""
+
+								geofenceScheduleSelectSQL := "SELECT GFS.geofence_id, GFS.vehicle_id, GFS.week_day, GFS.start_time, GFS.end_time, GFS.is_active, GF.geofence_coordiantes"
+								geofenceScheduleSelectSQL = fmt.Sprint(geofenceScheduleSelectSQL, " FROM geo_fence_schedules AS GFS")
+								geofenceScheduleSelectSQL = fmt.Sprint(geofenceScheduleSelectSQL, " LEFT JOIN geo_fences AS GF ON GF.geofence_id = GFS.geofence_id")
+								geofenceScheduleSelectSQL = fmt.Sprint(geofenceScheduleSelectSQL, " WHERE GFS.is_active = 1 AND GFS.vehicle_id = ? AND (? BETWEEN GFS.start_time AND GFS.end_time)")
+								geofenceSchedules, scheduleError := db.Query(geofenceScheduleSelectSQL, _vehicleId, dataProcessingTime)
+								if scheduleError == nil {
+									var _geofenceId, _geofenceIsActive int
+									var _weekDay, _geofenceScheduleStartTime, _geofenceScheduleEndTime string
+									for geofenceSchedules.Next() {
+										geofenceScheduleError := geofenceSchedules.Scan(&_geofenceId, &_vehicleId, &_weekDay, &_geofenceScheduleStartTime, &_geofenceScheduleEndTime, &_geofenceIsActive, &geofenceCoordinates)
+										if geofenceScheduleError == nil {
+											scheduledDay, _ := strconv.Atoi(_weekDay)
+											if len(geofenceCoordinates) > 0 && (scheduledDay == 7 || scheduledDay == weekDay) {
+												weekDayFlag = true
+												break
+											}
+										}
+									}
+								}
+
+								if weekDayFlag {
+									vertics := []pip.Point{}
+									fence := strings.Split(geofenceCoordinates, "|")
+									// complete the fence by pushing first vertics
+									fence = append(fence, fence[0])
+									fmt.Println(fence)
+									for i := 0; i < len(fence); i++ {
+										pointString := strings.Split(fence[i], ",")
+										xAxis, _ := strconv.ParseFloat(pointString[0], 64)
+										yAxis, _ := strconv.ParseFloat(pointString[1], 64)
+										vertics = append(vertics, pip.Point{X: xAxis, Y: yAxis})
+									}
+									geofencePloygon := pip.Polygon{
+										vertics,
+									}
+									checkPoint := pip.Point{X: latitudeInDecimalMinutes, Y: longitudeInDecimalMinutes}
+									fmt.Println(checkPoint)
+									insideGeofence := pip.PointInPolygon(checkPoint, geofencePloygon) //false=outside | true=inside geofence
+									geofenceAlartMessage := ""
+									geofenceAlartSMSFlag := false
+									if len(locationAddress) == 0 {
+										locationAddressForGeofenceAlart, addressError := getLocationAddress(latitudeInDecimalMinutes, longitudeInDecimalMinutes)
+										if addressError != nil {
+											db.Close()
+											return
+										}
+										locationAddress = locationAddressForGeofenceAlart
+									}
+									if geofenceINFlag && insideGeofence {
+										textMessageGeofenceIN = fmt.Sprint(textMessageGeofenceIN, locationAddress)
+										if len(textMessageGeofenceIN) > 160 {
+											geofenceAlartMessage = textMessageGeofenceIN[:159]
+										} else {
+											geofenceAlartMessage = textMessageGeofenceIN
+										}
+										//update the flag
+										geofenceAlartSMSFlag = true
+										geofenceSMSStatus = "IN"
+									} else if geofenceOUTFlag && insideGeofence == false {
+										textMessageGeofenceOUT = fmt.Sprint(textMessageGeofenceOUT, locationAddress)
+										if len(textMessageGeofenceOUT) > 160 {
+											geofenceAlartMessage = textMessageGeofenceOUT[:159]
+										} else {
+											geofenceAlartMessage = textMessageGeofenceOUT
+										}
+										//update the flag
+										geofenceAlartSMSFlag = true
+										geofenceSMSStatus = "OUT"
+									}
+									if geofenceAlartSMSFlag {
+										isSMSLogUpdated = updateSMSLog(db, _userId, _vehicleId, _smsYear, _smsMonth, _smsTotal, _smsUsed, _smsRemain, "GEO_FENCE", geofenceAlartMessage, _callBackSim, dateTimeFormated, geofenceSMSStatus)
+										if isSMSLogUpdated {
+											geofenceSmsText := url.QueryEscape(geofenceAlartMessage)
+											smsApiUrl = fmt.Sprint(SMS_API, "&SMSText=", geofenceSmsText, "&GSM=", _callBackSim)
+											//send sms
+											http.Get(smsApiUrl)
+											fmt.Println("-> SMS sent for geo-fence: " + geofenceSMSStatus)
+										}
+									}
+								}
+							}
+						}
+					}
+
+				}
+				/* handle alarm data */
+				if incomingDataProtocol == "16" && loginState == true {
+					//update previous location data update time
+					locationDataLastTime = time.Now()
+
+					hexDatetime := incomingDataPacket[8:20]
+					//quantityOfGPS := incomingDataPacket[20:22]
+					hexLatitude := incomingDataPacket[22:30]
+					hexLongitude := incomingDataPacket[30:38]
+					hexSpeed := incomingDataPacket[38:40]
+					hexCourseStatus := incomingDataPacket[40:44]
+					//hexLBSLength := incomingDataPacket[44:46]
+					//hexMCC := incomingDataPacket[46:50]
+					//hexMNC := incomingDataPacket[50:52]
+					//hexLAC := incomingDataPacket[52:56]
+					//hexCellID := incomingDataPacket[56:62]
+
+					/* alarm data datetime */
+					dateTimeFormated = hex2Datetime(hexDatetime)
+					/*Print*/
+					//fmt.Println(fmt.Sprint("16->dateTimeFormated: ", dateTimeFormated))
+					if dateTimeFormated == "" {
+						fmt.Println("Datetime conversion error from hex string")
+						continue
+					}
+					dateFormatedArrayLocation := strings.Split(dateTimeFormated, " ")
+					dateFormated = dateFormatedArrayLocation[0]
+					/* Calculate latitude and longitude */
+					latitudeDecimal, latConverErr := hex2Int(hexLatitude)
+					if latConverErr != nil {
+						fmt.Println("Latitude conversion error from hex string")
+						continue
+					}
+					latitudeInDecimalMinutes = (float64(latitudeDecimal) / 30000) / 60
+					/*print*/
+					//fmt.Println(fmt.Sprint("16->latitudeInDecimalMinutes: ", latitudeInDecimalMinutes))
+
+					longitudeDecimal, lonConverErr := hex2Int(hexLongitude)
+					if lonConverErr != nil {
+						fmt.Println("Longitude conversion error from hex string")
+						continue
+					}
+					longitudeInDecimalMinutes = (float64(longitudeDecimal) / 30000) / 60
+					/*Print*/
+					//fmt.Println(fmt.Sprint("16->longitudeInDecimalMinutes: ", longitudeInDecimalMinutes))
+
+					/* Calculate speed in km/h */
+					speedFromHex, speedConverErr := hex2Int(hexSpeed)
+					if speedConverErr != nil {
+						fmt.Println("Speed conversion error from hex string")
+						continue
+					}
+					speedInDecimal = float64(speedFromHex)
+					/*Print*/
+					//fmt.Println(fmt.Sprint("16->speedInDecimal: ", speedInDecimal))
+
+					/* Calculate course and status */
+					byteBinary, courceErr := hex2Bin(hexCourseStatus)
+					if courceErr != nil {
+						fmt.Println("Course and status conversion error from hex string")
+						continue
+					}
+					if byteBinary[4:5] == "0" {
+						e_w_indicator = "E"
+					} else {
+						e_w_indicator = "W"
+					}
+					if byteBinary[5:6] == "0" {
+						n_s_indicator = "S"
+					} else {
+						n_s_indicator = "N"
+					}
+
+					/* determine moving direction */
+					if n_s_indicator == "N" {
+						movingDirection = "north"
+					} else {
+						movingDirection = "south"
+					}
+					if e_w_indicator == "E" {
+						movingDirection = fmt.Sprint(movingDirection, "-east")
+					} else {
+						movingDirection = fmt.Sprint(movingDirection, "-west")
+					}
+					/*Print*/
+					//fmt.Println(fmt.Sprint("16->movingDirection: ", movingDirection))
+
+					bearingValue, bearingConverError := bin2Int(byteBinary[6:16]) //course in decimal degree
+					if bearingConverError == nil {
+						bearing = fmt.Sprint(bearingValue)
+					}
+					/*Print*/
+					//fmt.Println(fmt.Sprint("16->bearing: ", bearing))
+
+					/* sensore data */
+					terminalStatus := incomingDataPacket[62:64]
+					voltageLevelStatus = incomingDataPacket[64:66]
+					gsmSignalStrength = incomingDataPacket[66:68]
+					alarmStatus = incomingDataPacket[68:70]
+					alarmLanguage = incomingDataPacket[70:72]
+					/*Print*/
+					//fmt.Println(fmt.Sprint("16->voltageLevelStatus: ", voltageLevelStatus))
+					//fmt.Println(fmt.Sprint("16->gsmSignalStrength: ", gsmSignalStrength))
+					//fmt.Println(fmt.Sprint("16->alarmStatus: ", alarmStatus))
+
+					/* convert terminal information into binary */
+					sensorDataBinary, sensorDataConversionError := hex2Bin(terminalStatus)
+					if sensorDataConversionError != nil {
+						fmt.Println("-> Sensor data conversion error for data-protocol 16: " + terminalId)
+						continue
+					}
+					/* update global variable */
+					fuelConnectionStatus = sensorDataBinary[:1]
+					gpsTrackingStatus = sensorDataBinary[1:2]
+					alarmType = sensorDataBinary[2:5]
+					chargeStatus = sensorDataBinary[5:6]
+					engine, engineErr := strconv.Atoi(sensorDataBinary[6:7])
+					if engineErr != nil {
+						fmt.Println("-> Engine status error for data-protocol 16: " + terminalId)
+						continue
+					}
+					engineStatus = engine
+					defenceStatus = sensorDataBinary[7:8]
+					/*Print*/
+					//fmt.Println(fmt.Sprint("16->Fuel connection status: ", fuelConnectionStatus))
+					//fmt.Println(fmt.Sprint("16->gps tracking status: ", gpsTrackingStatus))
+					//fmt.Println(fmt.Sprint("16->Alarm type: ", alarmType))
+					//fmt.Println(fmt.Sprint("16->Charge status", chargeStatus))
+					//fmt.Println(fmt.Sprint("16->Engine Status: ", engineStatus))
+
+					/* set locationDataFlag to true */
+					locationDataFlag = true
+
+					//prepare insert query for gps_data_tr06 table
+					insertSQL := "INSERT gps_data_tr06 SET device_emei=?, record_date=?, record_time=?,"
+					insertSQL = fmt.Sprint(insertSQL, " data_status=?, engine_status=?, speed=?,")
+					insertSQL = fmt.Sprint(insertSQL, " latitude=?, longitude=?, n_s_indicator=?,")
+					insertSQL = fmt.Sprint(insertSQL, " e_w_indicator=?, bearing=?, direction=?,")
+					insertSQL = fmt.Sprint(insertSQL, " ac_status=?, fuel_connection_status=?, gps_tracking_status=?,")
+					insertSQL = fmt.Sprint(insertSQL, " alarm_status=?, alarm_type=?, charge_status=?,")
+					insertSQL = fmt.Sprint(insertSQL, " defence_status=?, voltage_level=?, gsm_signal_strength=?, alarm_language=?")
+					//prepared statement
+					preparedStmt, stmtError := db.Prepare(insertSQL)
+					if stmtError != nil {
+						continue
+					}
+					//execute prepared statement
+					dbResult, execError := preparedStmt.Exec(terminalId, dateFormated, dateTimeFormated,
+						dataType, engineStatus, speedInDecimal,
+						latitudeInDecimalMinutes, longitudeInDecimalMinutes, n_s_indicator,
+						e_w_indicator, bearing, movingDirection,
+						acStatus, fuelConnectionStatus, gpsTrackingStatus,
+						alarmStatus, alarmType, chargeStatus,
+						defenceStatus, voltageLevelStatus, gsmSignalStrength, alarmLanguage)
+					if execError != nil {
+						continue
+					} else {
+						_ = dbResult
+					}
+				}
+				/* write back to client incase of login/heart-bit data */
+				if dataType == "A" && (incomingDataProtocol == "01" || incomingDataProtocol == "13") {
+					/* prepare response data */
+					outgoingDataPacket := startBits                                           // initialize with start bits.
+					responseDataLength := "05"                                                //hex represent of decimal 5
+					outgoingDataPacket = fmt.Sprint(outgoingDataPacket, responseDataLength)   //push data length
+					outgoingDataPacket = fmt.Sprint(outgoingDataPacket, incomingDataProtocol) //push protocol no.
+					outgoingDataPacket = fmt.Sprint(outgoingDataPacket, serialNo)             //push serial no
+					/* generate and push error code */
+					data_p := fmt.Sprint(responseDataLength, incomingDataProtocol, serialNo)
+					responseErrorHex, _ := hex.DecodeString(data_p)
+					responseDataCRC := Checksum(responseErrorHex, table)                     //Error code in uint16
+					outgoingDataErrorCode := strconv.FormatUint(uint64(responseDataCRC), 16) //Error code in string
+					outgoingDataPacket = fmt.Sprint(outgoingDataPacket, outgoingDataErrorCode)
+
+					outgoingDataPacket = fmt.Sprint(outgoingDataPacket, stopBits) //push stop bit
+					/* send response to terminal */
+					fmt.Println("OUTGOING :" + outgoingDataPacket)
+					hexDataPacket, responseDataError := hex.DecodeString(outgoingDataPacket)
+					/* set login status */
+					if responseDataError == nil {
+						conn.Write(hexDataPacket)
+					} else {
+						fmt.Println("Response Data Error for :" + terminalId)
+						fmt.Println(responseDataError.Error())
+						return
+					}
+					if incomingDataProtocol == "01" {
+						loginState = true
+					}
+				}
+			} else {
+				fmt.Println("*** UNKNOWN DATA: " + incomingDataPacket)
 			}
-			/* handle location data */
-			if incomingDataProtocol == "12" && loginState == true {
-				//update previous location data update time
-				locationDataLastTime = time.Now()
+		}
+		// Close DB connection
+		fmt.Println("Closing DB Connection")
+		db.Close()
+	}
+}
 
-				hexDatetime := incomingDataPacket[8:20]
-				//quantityOfGPS := incomingDataPacket[20:22]
-				hexLatitude := incomingDataPacket[22:30]
-				hexLongitude := incomingDataPacket[30:38]
-				hexSpeed := incomingDataPacket[38:40]
-				hexCourseStatus := incomingDataPacket[40:44]
-				//hexMCC := incomingDataPacket[44:48]
-				//hexMNC := incomingDataPacket[48:50]
-				//hexLAC := incomingDataPacket[50:54]
-				//hexCellID := incomingDataPacket[54:60]
-
-				/* location data datetime */
-				dateTimeFormated = hex2Datetime(hexDatetime)
-				if dateTimeFormated == "" {
-					db.Close()
-					fmt.Println("Datetime conversion error from hex string")
-					continue
-				}
-				dateFormatedArrayLocation := strings.Split(dateTimeFormated, " ")
-				dateFormated = dateFormatedArrayLocation[0]
-				/* Calculate latitude and longitude */
-				latitudeDecimal, latConverErr := hex2Int(hexLatitude)
-				if latConverErr != nil {
-					db.Close()
-					fmt.Println("Latitude conversion error from hex string")
-					continue
-				}
-				latitudeInDecimalMinutes = (float64(latitudeDecimal) / 30000) / 60
-				longitudeDecimal, lonConverErr := hex2Int(hexLongitude)
-				if lonConverErr != nil {
-					db.Close()
-					fmt.Println("Longitude conversion error from hex string")
-					continue
-				}
-				longitudeInDecimalMinutes = (float64(longitudeDecimal) / 30000) / 60
-				/* Calculate speed in km/h */
-				speedFromHex, speedConverErr := hex2Int(hexSpeed)
-				if speedConverErr != nil {
-					db.Close()
-					fmt.Println("Speed conversion error from hex string")
-					continue
-				}
-				speedInDecimal = float64(speedFromHex)
-				/* Calculate course and status */
-				byteBinary, courceErr := hex2Bin(hexCourseStatus)
-				if courceErr != nil {
-					db.Close()
-					fmt.Println("Course and status conversion error from hex string")
-					continue
-				}
-				if byteBinary[4:5] == "0" {
-					e_w_indicator = "E"
-				} else {
-					e_w_indicator = "W"
-				}
-				if byteBinary[5:6] == "0" {
-					n_s_indicator = "S"
-				} else {
-					n_s_indicator = "N"
-				}
-
-				/* determine moving direction */
-				if n_s_indicator == "N" {
-					movingDirection = "north"
-				} else {
-					movingDirection = "south"
-				}
-				if e_w_indicator == "E" {
-					movingDirection = fmt.Sprint(movingDirection, "-east")
-				} else {
-					movingDirection = fmt.Sprint(movingDirection, "-west")
-				}
-
-				bearingValue, bearingConverError := bin2Int(byteBinary[6:16]) //course in decimal degree
-				if bearingConverError == nil {
-					bearing = fmt.Sprint(bearingValue)
-				}
-
-				//insert into gps_data_tr06 table
-				insertSQL := "INSERT gps_data_tr06 SET device_emei=?, record_date=?, record_time=?,"
-				insertSQL = fmt.Sprint(insertSQL, " data_status=?, engine_status=?, speed=?,")
-				insertSQL = fmt.Sprint(insertSQL, " latitude=?, longitude=?, n_s_indicator=?,")
-				insertSQL = fmt.Sprint(insertSQL, " e_w_indicator=?, bearing=?, direction=?,")
-				insertSQL = fmt.Sprint(insertSQL, " ac_status=?, fuel_connection_status=?, gps_tracking_status=?,")
-				insertSQL = fmt.Sprint(insertSQL, " alarm_status=?, alarm_type=?, charge_status=?,")
-				insertSQL = fmt.Sprint(insertSQL, " defence_status=?, voltage_level=?, gsm_signal_strength=?, alarm_language=?")
-				//prepared statement
-				preparedStmt, stmtError := db.Prepare(insertSQL)
-				if stmtError != nil {
-					db.Close()
-					continue
-				}
-				//execute prepared statement
-				dbResult, execError := preparedStmt.Exec(terminalId, dateFormated, dateTimeFormated,
-					dataType, engineStatus, speedInDecimal,
-					latitudeInDecimalMinutes, longitudeInDecimalMinutes, n_s_indicator,
-					e_w_indicator, bearing, movingDirection,
-					acStatus, fuelConnectionStatus, gpsTrackingStatus,
-					alarmStatus, alarmType, chargeStatus,
-					defenceStatus, voltageLevelStatus, gsmSignalStrength, alarmLanguage)
-				if execError != nil {
-					db.Close()
-					continue
-				} else {
-					_ = dbResult
-				}
-				//make sure db connection is closed
-				db.Close()
-
-			}
-			/* handle alarm data */
-			if incomingDataProtocol == "16" && loginState == true {
-				//update previous location data update time
-				locationDataLastTime = time.Now()
-
-				hexDatetime := incomingDataPacket[8:20]
-				//quantityOfGPS := incomingDataPacket[20:22]
-				hexLatitude := incomingDataPacket[22:30]
-				hexLongitude := incomingDataPacket[30:38]
-				hexSpeed := incomingDataPacket[38:40]
-				hexCourseStatus := incomingDataPacket[40:44]
-				//hexLBSLength := incomingDataPacket[44:46]
-				//hexMCC := incomingDataPacket[46:50]
-				//hexMNC := incomingDataPacket[50:52]
-				//hexLAC := incomingDataPacket[52:56]
-				//hexCellID := incomingDataPacket[56:62]
-
-				/* alarm data datetime */
-				dateTimeFormated = hex2Datetime(hexDatetime)
-				if dateTimeFormated == "" {
-					db.Close()
-					fmt.Println("Datetime conversion error from hex string")
-					continue
-				}
-				dateFormatedArrayLocation := strings.Split(dateTimeFormated, " ")
-				dateFormated = dateFormatedArrayLocation[0]
-				/* Calculate latitude and longitude */
-				latitudeDecimal, latConverErr := hex2Int(hexLatitude)
-				if latConverErr != nil {
-					db.Close()
-					fmt.Println("Latitude conversion error from hex string")
-					continue
-				}
-				latitudeInDecimalMinutes = (float64(latitudeDecimal) / 30000) / 60
-				longitudeDecimal, lonConverErr := hex2Int(hexLongitude)
-				if lonConverErr != nil {
-					db.Close()
-					fmt.Println("Longitude conversion error from hex string")
-					continue
-				}
-				longitudeInDecimalMinutes = (float64(longitudeDecimal) / 30000) / 60
-				/* Calculate speed in km/h */
-				speedFromHex, speedConverErr := hex2Int(hexSpeed)
-				if speedConverErr != nil {
-					db.Close()
-					fmt.Println("Speed conversion error from hex string")
-					continue
-				}
-				speedInDecimal = float64(speedFromHex)
-				/* Calculate course and status */
-				byteBinary, courceErr := hex2Bin(hexCourseStatus)
-				if courceErr != nil {
-					db.Close()
-					fmt.Println("Course and status conversion error from hex string")
-					continue
-				}
-				if byteBinary[4:5] == "0" {
-					e_w_indicator = "E"
-				} else {
-					e_w_indicator = "W"
-				}
-				if byteBinary[5:6] == "0" {
-					n_s_indicator = "S"
-				} else {
-					n_s_indicator = "N"
-				}
-
-				/* determine moving direction */
-				if n_s_indicator == "N" {
-					movingDirection = "north"
-				} else {
-					movingDirection = "south"
-				}
-				if e_w_indicator == "E" {
-					movingDirection = fmt.Sprint(movingDirection, "-east")
-				} else {
-					movingDirection = fmt.Sprint(movingDirection, "-west")
-				}
-
-				bearingValue, bearingConverError := bin2Int(byteBinary[6:16]) //course in decimal degree
-				if bearingConverError == nil {
-					bearing = fmt.Sprint(bearingValue)
-				}
-
-				/* sensore data */
-				terminalStatus := incomingDataPacket[62:64]
-				voltageLevelStatus = incomingDataPacket[64:66]
-				gsmSignalStrength = incomingDataPacket[66:68]
-				alarmStatus = incomingDataPacket[68:70]
-				alarmLanguage = incomingDataPacket[70:72]
-
-				/* convert terminal information into binary */
-				sensorDataBinary, sensorDataConversionError := hex2Bin(terminalStatus)
-				if sensorDataConversionError != nil {
-					fmt.Println("-> Sensor data conversion error for data-protocol 16: " + terminalId)
-					db.Close()
-					continue
-				}
-				/* update global variable */
-				fuelConnectionStatus = sensorDataBinary[:1]
-				gpsTrackingStatus = sensorDataBinary[1:2]
-				alarmType = sensorDataBinary[2:5]
-				chargeStatus = sensorDataBinary[5:6]
-				engine, engineErr := strconv.Atoi(sensorDataBinary[6:7])
-				if engineErr != nil {
-					fmt.Println("-> Engine status error for data-protocol 16: " + terminalId)
-					db.Close()
-					continue
-				}
-				engineStatus = engine
-				defenceStatus = sensorDataBinary[7:8]
-
-				/* set locationDataFlag to true */
-				locationDataFlag = true
-
-				//prepare insert query for gps_data_tr06 table
-				insertSQL := "INSERT gps_data_tr06 SET device_emei=?, record_date=?, record_time=?,"
-				insertSQL = fmt.Sprint(insertSQL, " data_status=?, engine_status=?, speed=?,")
-				insertSQL = fmt.Sprint(insertSQL, " latitude=?, longitude=?, n_s_indicator=?,")
-				insertSQL = fmt.Sprint(insertSQL, " e_w_indicator=?, bearing=?, direction=?,")
-				insertSQL = fmt.Sprint(insertSQL, " ac_status=?, fuel_connection_status=?, gps_tracking_status=?,")
-				insertSQL = fmt.Sprint(insertSQL, " alarm_status=?, alarm_type=?, charge_status=?,")
-				insertSQL = fmt.Sprint(insertSQL, " defence_status=?, voltage_level=?, gsm_signal_strength=?, alarm_language=?")
-				//prepared statement
-				preparedStmt, stmtError := db.Prepare(insertSQL)
-				if stmtError != nil {
-					db.Close()
-					continue
-				}
-				//execute prepared statement
-				dbResult, execError := preparedStmt.Exec(terminalId, dateFormated, dateTimeFormated,
-					dataType, engineStatus, speedInDecimal,
-					latitudeInDecimalMinutes, longitudeInDecimalMinutes, n_s_indicator,
-					e_w_indicator, bearing, movingDirection,
-					acStatus, fuelConnectionStatus, gpsTrackingStatus,
-					alarmStatus, alarmType, chargeStatus,
-					defenceStatus, voltageLevelStatus, gsmSignalStrength, alarmLanguage)
-				if execError != nil {
-					db.Close()
-					continue
-				} else {
-					_ = dbResult
-				}
-				//make sure db connection is closed
-				db.Close()
-
-			}
-			/* write back to client incase of login/heart-bit data */
-			if dataType == "A" && (incomingDataProtocol == "01" || incomingDataProtocol == "13") {
-				/* prepare response data */
-				outgoingDataPacket := startBits                                           // initialize with start bits.
-				responseDataLength := "05"                                                //hex represent of decimal 5
-				outgoingDataPacket = fmt.Sprint(outgoingDataPacket, responseDataLength)   //push data length
-				outgoingDataPacket = fmt.Sprint(outgoingDataPacket, incomingDataProtocol) //push protocol no.
-				outgoingDataPacket = fmt.Sprint(outgoingDataPacket, serialNo)             //push serial no
-				/* generate and push error code */
-				data_p := fmt.Sprint(responseDataLength, incomingDataProtocol, serialNo)
-				responseErrorHex, _ := hex.DecodeString(data_p)
-				responseDataCRC := Checksum(responseErrorHex, table)                     //Error code in uint16
-				outgoingDataErrorCode := strconv.FormatUint(uint64(responseDataCRC), 16) //Error code in string
-				outgoingDataPacket = fmt.Sprint(outgoingDataPacket, outgoingDataErrorCode)
-
-				outgoingDataPacket = fmt.Sprint(outgoingDataPacket, stopBits) //push stop bit
-				/* send response to terminal */
-				hexDataPacket, responseDataError := hex.DecodeString(outgoingDataPacket)
-				conn.Write(hexDataPacket)
-				/* set login status */
-				if incomingDataProtocol == "01" && responseDataError == nil {
-					loginState = true
-				} else {
-					fmt.Println("Response Data Error for :" + terminalId)
-					fmt.Println(responseDataError.Error())
-				}
-			}
+func updateSMSLog(_db *sql.DB, uId int, vId int, smsYear int, smsMonth int, smsTotal int, smsUsed int, smsRemain int, smsType string, sms string, callBackSim string, exeDatetime string, smsStatus string) bool {
+	smsLogFlag := false
+	smsUsedFrom := "MONTHLY"
+	updateSQL := ""
+	if smsUsed < smsTotal { //deduct sms from user monthly sms
+		updateSQL = "UPDATE sms_monthly SET sms_used = (sms_used + 1) WHERE user_id = ? AND sms_year = ? and sms_month = ?"
+		updateStmt, _err := _db.Prepare(updateSQL)
+		result, _err := updateStmt.Exec(uId, smsYear, smsMonth)
+		if _err != nil {
+			return false
 		} else {
-			fmt.Println("*** UNKNOWN DATA: " + incomingDataPacket)
+			_ = result
+		}
+		smsLogFlag = true
+	} else if smsUsed >= smsTotal && smsRemain > 0 {
+		smsUsedFrom = "RESERVED"
+		updateSQL = "UPDATE users SET remaining_sms = (remaining_sms - 1) WHERE user_id = ?"
+		updateStmt, _err := _db.Prepare(updateSQL)
+		result, _err := updateStmt.Exec(uId)
+		if _err != nil {
+			return false
+		} else {
+			_ = result
+		}
+		smsLogFlag = true
+	}
+
+	//insert into sms_log table
+	if smsLogFlag {
+		smsLogInsertSQL := "INSERT INTO sms_log (vehicle_id, sms_type, receipent, sms, sending_time, sending_type, sms_used_from, geofence_sms_status) VALUES (?,?,?,?,?,?,?,?)"
+		insertStmt, _err := _db.Prepare(smsLogInsertSQL)
+		result, _err := insertStmt.Exec(vId, smsType, callBackSim, sms, exeDatetime, "AUTO", smsUsedFrom, smsStatus)
+		if _err != nil {
+			return false
+		} else {
+			_ = result
 		}
 	}
+
+	return smsLogFlag
 }
 
 func timeDifferenceInMinutes(startTime time.Time, endTime time.Time) float64 {
@@ -673,4 +946,37 @@ func Checksum(data []byte, table *Table) uint16 {
 	crc := Init(table)
 	crc = Update(crc, data, table)
 	return Complete(crc, table)
+}
+
+func getLocationAddress(lat float64, lng float64) (string, error) {
+	formatedAddress := ""
+	url := fmt.Sprint("https://maps.googleapis.com/maps/api/geocode/json?latlng=", lat, ",", lng)
+	getResp, err := http.Get(url)
+	if err != nil {
+		return formatedAddress, err
+	}
+	defer getResp.Body.Close()
+
+	resp := new(Response)
+	if getResp.StatusCode == 200 { // OK
+		err = json.NewDecoder(getResp.Body).Decode(resp)
+	}
+	if err != nil {
+		return formatedAddress, err
+	} else {
+		formatedAddress = resp.GoogleResponse.Results[0].Address
+	}
+	return formatedAddress, nil
+}
+
+type Response struct {
+	*GoogleResponse
+}
+
+type GoogleResponse struct {
+	Results []*GoogleResult
+}
+
+type GoogleResult struct {
+	Address string `json:"formatted_address"`
 }
